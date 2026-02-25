@@ -6,7 +6,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import pandas as pd
 from pykrx import stock
@@ -41,10 +41,13 @@ def _today_yyyymmdd_kst() -> str:
     return datetime.now(KST).strftime("%Y%m%d")
 
 
+def _is_trading_day(yyyymmdd: str) -> bool:
+    """Fast trading-day check: KOSPI tickers non-empty."""
+    t = stock.get_market_ticker_list(yyyymmdd, market="KOSPI")
+    return isinstance(t, list) and len(t) > 0
+
+
 def _pick_last_trading_day_kst(target: Optional[str] = None, max_back: int = 21) -> str:
-    """
-    PyKRX는 비거래일/사이트 변동 시 데이터가 비거나 예외가 날 수 있어, 최근 거래일을 역으로 찾는다.
-    """
     if target is None:
         base = datetime.now(KST).date()
     else:
@@ -55,13 +58,45 @@ def _pick_last_trading_day_kst(target: Optional[str] = None, max_back: int = 21)
         d = base - timedelta(days=i)
         ymd = d.strftime("%Y%m%d")
         try:
-            t = stock.get_market_ticker_list(ymd, market="KOSPI")
-            if isinstance(t, list) and len(t) > 0:
+            if _is_trading_day(ymd):
                 return ymd
         except Exception as e:
             last_exc = e
 
     raise RuntimeError(f"Could not find a recent trading day (last_exc={last_exc}).")
+
+
+def _get_last_n_trading_days(end_yyyymmdd: str, n: int, max_back: int = 120) -> List[str]:
+    """
+    Returns a list of last N trading days (ascending), ending at end_yyyymmdd (or earlier if end isn't trading day).
+    Uses get_market_ohlcv_by_ticker which is much cheaper than per-ticker calls.
+    """
+    end_td = _pick_last_trading_day_kst(end_yyyymmdd)
+    end_date = datetime.strptime(end_td, "%Y%m%d").date()
+
+    days: List[str] = []
+    checked = 0
+    i = 0
+    last_exc: Optional[Exception] = None
+    while len(days) < n and checked < max_back:
+        d = end_date - timedelta(days=i)
+        i += 1
+        checked += 1
+        ymd = d.strftime("%Y%m%d")
+        try:
+            # This call fails/returns empty on non-trading days.
+            df = stock.get_market_ohlcv_by_ticker(date=ymd, market="KOSPI")
+            if df is None or len(df) == 0:
+                continue
+            days.append(ymd)
+        except Exception as e:
+            last_exc = e
+            continue
+
+    if len(days) < n:
+        raise RuntimeError(f"Could not collect {n} trading days within lookback. got={len(days)} last_exc={last_exc}")
+
+    return sorted(days)  # ascending
 
 
 def _backup_universe(universe_path: Path, backup_dir: Path, ymd: str) -> None:
@@ -77,11 +112,10 @@ def _save_universe(universe_path: Path, tickers: list[str]) -> None:
 
 
 def build_universe(rules: Rules) -> tuple[str, pd.DataFrame]:
-    if rules.asof == "auto":
-        asof = _pick_last_trading_day_kst(None)
-    else:
-        asof = _pick_last_trading_day_kst(rules.asof)
+    # 1) asof
+    asof = _pick_last_trading_day_kst(None if rules.asof == "auto" else rules.asof)
 
+    # 2) market cap table (single call)
     mcap_df = stock.get_market_cap_by_ticker(asof, market=rules.market)
     if mcap_df is None or len(mcap_df) == 0:
         raise RuntimeError("market cap dataframe is empty")
@@ -93,34 +127,26 @@ def build_universe(rules: Rules) -> tuple[str, pd.DataFrame]:
     df["price"] = mcap_df["종가"].astype("float64")
     df["mcap"] = mcap_df["시가총액"].astype("float64")
 
-    # Top N by market cap
+    # 3) Top N by mcap
     df = df.sort_values("mcap", ascending=False).head(int(rules.top_n_mcap))
+    tickers = df.index.tolist()
 
-    # Turnover 20D avg (KRW)
-    end = asof
-    start_date = (datetime.strptime(asof, "%Y%m%d") - timedelta(days=90)).strftime("%Y%m%d")
+    # 4) Turnover 20D avg (bulk, 20 calls instead of 1200 calls)
+    trading_days = _get_last_n_trading_days(asof, int(rules.turnover_lookback))
+    tv_sum = pd.Series(0.0, index=tickers)
 
-    turnovers: dict[str, float] = {}
-    for ticker in df.index.tolist():
-        try:
-            ohlcv = stock.get_market_ohlcv_by_date(start_date, end, ticker)
-            if ohlcv is None or len(ohlcv) == 0:
-                continue
-            if "거래대금" not in ohlcv.columns:
-                continue
-
-            tv = ohlcv["거래대금"].dropna().astype("float64").tail(int(rules.turnover_lookback))
-            if len(tv) < max(5, int(rules.turnover_lookback * 0.7)):
-                continue
-
-            turnovers[ticker] = float(tv.mean())
-        except Exception:
+    for day in trading_days:
+        # market-wide ohlcv for the day; includes 거래대금
+        day_df = stock.get_market_ohlcv_by_ticker(date=day, market=rules.market)
+        if day_df is None or len(day_df) == 0 or "거래대금" not in day_df.columns:
             continue
+        sub = day_df.reindex(tickers)
+        tv = sub["거래대금"].astype("float64").fillna(0.0)
+        tv_sum = tv_sum.add(tv, fill_value=0.0)
 
-    df["turnover_krw_20d"] = pd.Series(turnovers)
+    df["turnover_krw_20d"] = (tv_sum / float(rules.turnover_lookback)).astype("float64")
 
-    # Filters
-    df = df.dropna(subset=["turnover_krw_20d"])
+    # 5) filters
     df = df[df["price"] >= float(rules.min_price_krw)]
     df = df[df["turnover_krw_20d"] >= float(rules.min_turnover_krw_20d)]
 
@@ -150,8 +176,11 @@ def main() -> int:
         _save_universe(universe_path, tickers)
 
         print(f"[OK] asof={asof} market={rules.market}")
-        print(f"[OK] universe_size={len(tickers)} (top_n_mcap={rules.top_n_mcap}, lookback={rules.turnover_lookback}, "
-              f"min_turnover_krw_20d={rules.min_turnover_krw_20d:,}, min_price_krw={rules.min_price_krw:,})")
+        print(
+            f"[OK] universe_size={len(tickers)} "
+            f"(top_n_mcap={rules.top_n_mcap}, lookback={rules.turnover_lookback}, "
+            f"min_turnover_krw_20d={rules.min_turnover_krw_20d:,}, min_price_krw={rules.min_price_krw:,})"
+        )
 
         preview = df_final.head(10).copy()
         preview["mcap"] = preview["mcap"].round(0).astype("int64")
