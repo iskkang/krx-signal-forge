@@ -3,13 +3,12 @@ name: Update KRX Universe
 on:
   workflow_dispatch:
   schedule:
-    # KST 07:10 = UTC 22:10 (전날)
+    # KST 07:10 = UTC 22:10 (previous day)
     - cron: "10 22 * * 1-5"
 
 jobs:
   update-universe:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
