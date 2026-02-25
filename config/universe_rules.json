@@ -1,0 +1,11 @@
+{
+  "market": "ALL",
+  "asof": "auto",
+  "top_n_mcap": 1200,
+
+  "turnover_lookback": 20,
+  "min_turnover_krw_20d": 5000000000,
+
+  "min_price_krw": 2000,
+  "min_count_valid": 700
+}
