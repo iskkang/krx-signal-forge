@@ -1,0 +1,32 @@
+{
+  "asof": "auto",
+  "lookback_days": 420,
+  "max_workers": 6,
+  "g1": {
+    "min_price_krw": 2000,
+    "min_turnover_krw_20d": 5000000000,
+    "min_history_days": 250
+  },
+  "g2": {
+    "trend_ma_days": 200,
+    "ema_fast_days": 20,
+    "ema_mid_days": 50,
+    "ema_slow_days": 200,
+    "require_close_above_ma200": true,
+    "reclaim_within_days": 3
+  },
+  "g3": {
+    "vol_lookback": 20,
+    "vol_spike_mult": 1.3,
+    "breakout_lookback": 10
+  },
+  "output": {
+    "max_hard": 6,
+    "max_soft": 15
+  },
+  "telegram": {
+    "enabled": false,
+    "env_token": "TELEGRAM_TOKEN",
+    "env_chat_id": "TELEGRAM_CHAT_ID"
+  }
+}
