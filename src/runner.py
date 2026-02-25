@@ -1,154 +1,144 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import sys
-from dataclasses import asdict
+import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, Tuple
 
 import pandas as pd
 
-from src.data.krx_loader import fetch_ohlcv
-from src.scan.gates import apply_gates, GateResult, Candidate
-from src.utils import Timer, repo_root, load_json, save_json, pick_last_trading_day_kst
-from src.telegram import maybe_send_from_env
+from .utils.timer import Timer
+from .utils.io import read_text_lines, read_json, write_json
+from .data.sqlite_cache import connect_sqlite, ensure_schema, upsert_prices, load_prices
+from .data.fdr_client import fetch_ohlcv, recent_start_for_lookback
+from .scanner import scan_one, Candidate
+from .telegram_bot import send_message
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SETTINGS_PATH = REPO_ROOT / "config" / "settings.json"
+STATE_DIR = REPO_ROOT / "state"
+STATE_DIR.mkdir(exist_ok=True)
 
-def load_universe(universe_path: Path) -> List[str]:
-    if not universe_path.exists():
-        return []
-    tickers = [x.strip() for x in universe_path.read_text(encoding="utf-8").splitlines() if x.strip()]
-    # de-dupe preserve order
-    seen = set()
-    out = []
-    for t in tickers:
-        if t not in seen:
-            out.append(t)
-            seen.add(t)
-    return out
+SQLITE_PATH = STATE_DIR / "market.sqlite"
+LAST_SIGNALS_PATH = STATE_DIR / "last_signals.json"
 
+def load_settings() -> dict[str, Any]:
+    return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
 
-def _format_candidate(c: Candidate) -> str:
-    tv = int(c.turnover_krw_20d)
-    name = c.name or ""
-    return f"- {c.ticker} {name} | price={c.price:,.0f} | tv20={tv:,} | score={c.score:.2f} | {c.reason}"
+def load_universe(universe_path: str) -> list[str]:
+    return read_text_lines(REPO_ROOT / universe_path)
 
+def load_name_map() -> dict[str, str]:
+    # optional file: config/name_map.json (Code -> Name)
+    p = REPO_ROOT / "config" / "name_map.json"
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {}
 
-def run_once() -> int:
-    root = repo_root()
-    rules = load_json(root / "config" / "scan_rules.json")
-    universe_path = root / "config" / "universe.txt"
-    state_path = root / "state" / "last_signals.json"
+def update_cache_for_ticker(con, ticker: str, lookback_bars: int) -> None:
+    # Fetch recent window and upsert (simple; incremental optimization can be added later)
+    start = recent_start_for_lookback(lookback_bars)
+    df = fetch_ohlcv(ticker, start=start)
+    if df is None or df.empty:
+        return
+    upsert_prices(con, ticker, df)
 
-    asof = pick_last_trading_day_kst(rules.get("asof", "auto"))
-    tickers = load_universe(universe_path)
+def format_candidate(c: Candidate) -> str:
+    m = c.metrics
+    return (
+        f"{c.ticker} {c.name} | {c.bucket} | score={c.score:.1f} "
+        f"close={m.get('close',0):.0f} ema20={m.get('ema20',0):.0f} "
+        f"vol={m.get('vol',0):.0f} vma20={m.get('vma20',0):.0f} atr%={m.get('atr14_pct',0):.1f}"
+    )
 
-    if not tickers:
-        print("[FAIL] universe.txt is empty. Run scripts/update_universe.py first.", file=sys.stderr)
-        return 2
+def run() -> int:
+    timer = Timer()
+    settings = load_settings()
+    timer.lap("load_settings")
 
-    drop_counter: Dict[str, int] = {}
-    skip_counter: Dict[str, int] = {}
-    hard: List[Candidate] = []
-    soft: List[Candidate] = []
+    universe = load_universe(settings["universe_path"])
+    name_map = load_name_map()
+    timer.lap("load_universe")
 
-    # load last signals to prevent duplicates
-    last = {}
-    if state_path.exists():
+    con = connect_sqlite(SQLITE_PATH)
+    ensure_schema(con)
+    timer.lap("open_sqlite")
+
+    last_state = read_json(LAST_SIGNALS_PATH, default={})
+    already_sent: dict[str, str] = last_state.get("sent", {})  # ticker -> last_bucket
+    drop: Dict[str, int] = {}
+    skip: Dict[str, int] = {}
+
+    candidates: list[Candidate] = []
+    lookback_bars = int(settings.get("lookback_bars", 260))
+
+    # Update cache + scan
+    for i, ticker in enumerate(universe, 1):
         try:
-            last = load_json(state_path)
+            update_cache_for_ticker(con, ticker, lookback_bars)
+            df = load_prices(con, ticker, limit=max(lookback_bars, 260))
+            name = name_map.get(ticker, "")
+            candidates.extend(scan_one(ticker, name, df, settings, drop, skip))
         except Exception:
-            last = {}
+            skip["fetch_or_scan_error"] = skip.get("fetch_or_scan_error", 0) + 1
 
-    timings: Dict[str, float] = {}
+    timer.lap("scan_all")
 
-    with Timer("total") as t_total:
-        for i, ticker in enumerate(tickers, 1):
-            with Timer("fetch") as t_fetch:
-                bars_obj = fetch_ohlcv(ticker=ticker, end_yyyymmdd=asof, lookback_days=int(rules["lookback_days"]))
-            timings["fetch_ms"] = timings.get("fetch_ms", 0.0) + t_fetch.elapsed_ms
+    hard = [c for c in candidates if c.bucket == "HARD"]
+    soft = [c for c in candidates if c.bucket == "SOFT"]
 
-            if bars_obj is None:
-                skip_counter["skip_fetch_none"] = skip_counter.get("skip_fetch_none", 0) + 1
-                continue
+    hard.sort(key=lambda x: (-x.score, x.ticker))
+    soft.sort(key=lambda x: (-x.score, x.ticker))
 
-            bars = bars_obj.df
+    hard = hard[: int(settings["output"]["max_hard"])]
+    soft = soft[: int(settings["output"]["max_soft"])]
 
-            # NOTE: Name lookup is optional; keep fast. (Can be added later via pykrx ticker name APIs.)
-            name = None
+    # Dedupe alerts (don't spam same ticker+bucket)
+    to_alert = []
+    for c in hard + soft:
+        prev = already_sent.get(c.ticker)
+        if prev == c.bucket:
+            continue
+        to_alert.append(c)
+        already_sent[c.ticker] = c.bucket
 
-            with Timer("gates") as t_g:
-                res, cand = apply_gates(
-                    ticker=ticker,
-                    name=name,
-                    bars=bars,
-                    rules=rules,
-                    drop_counter=drop_counter,
-                    skip_counter=skip_counter,
-                )
-            timings["gates_ms"] = timings.get("gates_ms", 0.0) + t_g.elapsed_ms
+    # Print summary
+    print(f"Scanned: {len(universe)} | candidates: {len(candidates)} | hard={len(hard)} soft={len(soft)}")
+    if drop:
+        top_drop = sorted(drop.items(), key=lambda x: -x[1])[:10]
+        print("Top drop reasons:", ", ".join([f"{k}:{v}" for k,v in top_drop]))
+    if skip:
+        top_skip = sorted(skip.items(), key=lambda x: -x[1])[:10]
+        print("Top skip reasons:", ", ".join([f"{k}:{v}" for k,v in top_skip]))
 
-            if cand is None:
-                continue
-
-            # dedupe: if hard signal already sent for this ticker on same asof, skip
-            key = f"{ticker}"
-            if res == GateResult.HARD:
-                if last.get(key, {}).get("asof") == asof and last.get(key, {}).get("tag") == "HARD":
-                    drop_counter["dup_hard_suppressed"] = drop_counter.get("dup_hard_suppressed", 0) + 1
-                    continue
-                hard.append(cand)
-            elif res == GateResult.SOFT:
-                soft.append(cand)
-
-    timings["total_ms"] = t_total.elapsed_ms
-
-    # sort
-    hard.sort(key=lambda c: (-c.score, -c.turnover_krw_20d, c.ticker))
-    soft.sort(key=lambda c: (-c.turnover_krw_20d, c.ticker))
-
-    hard = hard[: int(rules["output"]["max_hard"])]
-    soft = soft[: int(rules["output"]["max_soft"])]
-
-    # render
-    lines = []
-    lines.append(f"📌 KRX Swing Scan (asof {asof})")
-    lines.append(f"- Universe: {len(tickers)}")
-    lines.append(f"- Hard: {len(hard)} | Soft: {len(soft)}")
-    lines.append("")
-    if hard:
-        lines.append("✅ HARD candidates")
-        lines.extend([_format_candidate(c) for c in hard])
-        lines.append("")
-    if soft:
-        lines.append("🟡 SOFT watchlist")
-        lines.extend([_format_candidate(c) for c in soft])
-        lines.append("")
-    # counters
-    def _top(d: Dict[str,int], n=10):
-        items = sorted(d.items(), key=lambda x: -x[1])[:n]
-        return ", ".join([f"{k}:{v}" for k,v in items]) if items else "-"
-
-    lines.append(f"Drop(top): {_top(drop_counter)}")
-    lines.append(f"Skip(top): {_top(skip_counter)}")
-    lines.append(f"Timing: total={timings.get('total_ms',0):.0f}ms, fetch={timings.get('fetch_ms',0):.0f}ms, gates={timings.get('gates_ms',0):.0f}ms")
-
-    msg = "\n".join(lines)
-    print(msg)
-
-    # save last signals (only store hard + asof)
-    out_last = dict(last) if isinstance(last, dict) else {}
+    print("\nHARD candidates")
     for c in hard:
-        out_last[c.ticker] = {"asof": asof, "tag": "HARD", "price": c.price, "score": c.score}
-    save_json(state_path, out_last)
+        print("-", format_candidate(c))
 
-    # telegram optional
-    tg = rules.get("telegram", {})
-    if tg.get("enabled", False):
-        maybe_send_from_env(tg.get("env_token","TELEGRAM_TOKEN"), tg.get("env_chat_id","TELEGRAM_CHAT_ID"), msg)
+    print("\nSOFT watchlist")
+    for c in soft:
+        print("-", format_candidate(c))
+
+    # Telegram
+    if settings.get("telegram", {}).get("enabled", False) and to_alert:
+        msg = "KRX Signal Forge\n" + "\n".join([format_candidate(c) for c in to_alert])
+        send_message(msg)
+
+    # Save state
+    write_json(LAST_SIGNALS_PATH, {
+        "asof": pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "sent": already_sent,
+        "summary": {
+            "scanned": len(universe),
+            "candidates": len(candidates),
+            "hard": len(hard),
+            "soft": len(soft),
+            "drop": drop,
+            "skip": skip,
+            "timing_ms": {lap.name: lap.ms for lap in timer.laps} | {"total": timer.total_ms()}
+        }
+    })
 
     return 0
 
-
 if __name__ == "__main__":
-    raise SystemExit(run_once())
+    raise SystemExit(run())

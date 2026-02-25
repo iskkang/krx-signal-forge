@@ -1,226 +1,142 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import json
-import sys
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+import re
+import time
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, List
 
 import pandas as pd
 import FinanceDataReader as fdr
 
 KST = timezone(timedelta(hours=9))
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CONFIG_DIR = REPO_ROOT / "config"
+STATE_DIR = REPO_ROOT / "state"
+CONFIG_DIR.mkdir(exist_ok=True)
+STATE_DIR.mkdir(exist_ok=True)
 
-@dataclass
-class Rules:
-    asof: str = "auto"  # "YYYYMMDD" or "auto"
-    markets: List[str] = None  # ["KOSPI","KOSDAQ"]
-    top_n_mcap: int = 1200
-    min_price_krw: int = 2000
-    # Universe 단계에서는 20D 평균 거래대금 대신, listing에 있는 'Amount'(당일 거래대금)로 1차 필터
-    min_amount_krw_today: int = 5_000_000_000
-    min_count_valid: int = 700
-    listing_cache_days: int = 3
+UNIVERSE_PATH = CONFIG_DIR / "universe.txt"
+NAME_MAP_PATH = CONFIG_DIR / "name_map.json"
+BACKUP_DIR = STATE_DIR / "universe_backups"
+BACKUP_DIR.mkdir(exist_ok=True)
 
-    def __post_init__(self):
-        if self.markets is None:
-            self.markets = ["KOSPI", "KOSDAQ"]
+# build cache to avoid recomputing everything when rerun locally
+BUILD_CACHE = STATE_DIR / "universe_traded_value_cache.csv"
 
+def _now_kst() -> str:
+    return datetime.now(KST).strftime("%Y%m%d_%H%M%S")
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+def _clean_krx_listing(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    cols = {c.lower(): c for c in df.columns}
+    code_col = cols.get("code") or cols.get("symbol") or cols.get("ticker")
+    name_col = cols.get("name")
+    mkt_col = cols.get("market")
 
+    if code_col is None:
+        raise RuntimeError(f"Cannot find code column in listing: {df.columns.tolist()}")
 
-def _load_rules(path: Path) -> Rules:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return Rules(**data)
+    df["Code"] = df[code_col].astype(str).str.zfill(6)
+    df["Name"] = df[name_col].astype(str) if name_col else ""
 
+    if mkt_col:
+        mkt = df[mkt_col].astype(str).str.upper()
+        df = df[(mkt == "KOSPI") | (mkt == "KOSDAQ")]
 
-def _today_yyyymmdd_kst() -> str:
-    return datetime.now(KST).strftime("%Y%m%d")
+    # Filter common non-common-stock instruments by name
+    bad = re.compile(r"(스팩|SPAC|리츠|REIT|ETN|ETF)", re.IGNORECASE)
+    df = df[~df["Name"].str.contains(bad, na=False)]
+    df = df[~df["Name"].str.contains(r"(우|우B|우C)$", na=False)]
 
+    df = df.drop_duplicates(subset=["Code"]).reset_index(drop=True)
+    return df[["Code", "Name"]]
 
-def _backup_universe(universe_path: Path, backup_dir: Path, ymd: str) -> None:
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    if universe_path.exists() and universe_path.read_text(encoding="utf-8").strip():
-        (backup_dir / f"universe_{ymd}.txt").write_text(universe_path.read_text(encoding="utf-8"), encoding="utf-8")
-
-
-def _save_universe(universe_path: Path, tickers: list[str]) -> None:
-    universe_path.parent.mkdir(parents=True, exist_ok=True)
-    universe_path.write_text("\n".join(tickers) + "\n", encoding="utf-8")
-
-
-def _asof_auto() -> str:
-    """
-    FDR은 '거래일 캘린더'를 직접 주지 않으니,
-    오늘부터 역으로 14일 탐색하면서 삼성전자 데이터가 1개라도 나오는 날짜를 거래일로 간주.
-    """
-    base = datetime.now(KST).date()
-    for i in range(14):
-        d = base - timedelta(days=i)
-        ymd = d.strftime("%Y%m%d")
-        try:
-            df = fdr.DataReader("005930", ymd, ymd)
-            if df is not None and len(df) > 0:
-                return ymd
-        except Exception:
-            continue
-    # 최후: 그냥 어제로
-    return (base - timedelta(days=1)).strftime("%Y%m%d")
-
-
-def _norm_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    FinanceDataReader.StockListing('KRX') 컬럼은 버전/소스에 따라 달라질 수 있어
-    가능한 키를 모두 흡수해 표준화한다.
-    """
-    out = df.copy()
-    # code/symbol
-    if "Code" in out.columns:
-        out.rename(columns={"Code": "Ticker"}, inplace=True)
-    elif "Symbol" in out.columns:
-        out.rename(columns={"Symbol": "Ticker"}, inplace=True)
-    elif "ticker" in out.columns:
-        out.rename(columns={"ticker": "Ticker"}, inplace=True)
-
-    # market
-    if "Market" not in out.columns and "MarketId" in out.columns:
-        out.rename(columns={"MarketId": "Market"}, inplace=True)
-
-    # price (Close)
-    if "Close" not in out.columns:
-        for c in ["Price", "Last", "종가"]:
-            if c in out.columns:
-                out.rename(columns={c: "Close"}, inplace=True)
-                break
-
-    # market cap
-    if "Marcap" not in out.columns:
-        for c in ["MarketCap", "시가총액", "MarCap"]:
-            if c in out.columns:
-                out.rename(columns={c: "Marcap"}, inplace=True)
-                break
-
-    # amount (trading value)
-    if "Amount" not in out.columns:
-        for c in ["거래대금", "Value", "TrValue"]:
-            if c in out.columns:
-                out.rename(columns={c: "Amount"}, inplace=True)
-                break
-
-    return out
-
-
-def _load_listing_cached(cache_path: Path, max_age_days: int) -> Optional[pd.DataFrame]:
-    if not cache_path.exists():
-        return None
+def _fetch_traded_value_20d(code: str) -> tuple[str, float] | None:
+    # traded value = mean(Close*Volume) over last 20 trading days
+    # Use short window for speed.
     try:
-        st = cache_path.stat()
-        age = datetime.now(KST) - datetime.fromtimestamp(st.st_mtime, tz=KST)
-        if age > timedelta(days=max_age_days):
+        df = fdr.DataReader(code)  # full history; unavoidable in FDR for now
+        if df is None or df.empty or len(df) < 25:
             return None
-        return pd.read_parquet(cache_path)
+        close = df["Close"].tail(25)
+        vol = df["Volume"].tail(25)
+        tv = (close * vol).tail(20).mean()
+        if pd.isna(tv):
+            return None
+        return code, float(tv)
     except Exception:
         return None
 
+def main():
+    # 1) listing
+    listing = fdr.StockListing("KRX")
+    listing = _clean_krx_listing(listing)
 
-def _save_listing_cache(cache_path: Path, df: pd.DataFrame) -> None:
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(cache_path, index=False)
+    # 2) build traded value cache (parallel)
+    #    For GitHub Actions, keep workers moderate to reduce transient failures.
+    max_workers = int(12)
+    codes = listing["Code"].tolist()
 
+    # If cache exists and is recent (same day), reuse it to speed reruns.
+    cached = None
+    if BUILD_CACHE.exists():
+        try:
+            cached = pd.read_csv(BUILD_CACHE)
+        except Exception:
+            cached = None
 
-def build_universe(rules: Rules) -> tuple[str, pd.DataFrame]:
-    asof = _asof_auto() if rules.asof == "auto" else rules.asof
+    tv_map: dict[str, float] = {}
+    if cached is not None and {"Code","TradedValue20D"}.issubset(set(cached.columns)):
+        for _, r in cached.iterrows():
+            tv_map[str(r["Code"]).zfill(6)] = float(r["TradedValue20D"])
 
-    # listing cache
-    root = _repo_root()
-    cache_path = root / "state" / "cache" / "krx_listing.parquet"
-    listing = _load_listing_cached(cache_path, rules.listing_cache_days)
-    if listing is None:
-        listing = fdr.StockListing("KRX")
-        listing = _norm_columns(listing)
-        _save_listing_cache(cache_path, listing)
+    missing = [c for c in codes if c not in tv_map]
+    print(f"[INFO] listing={len(codes)} cached={len(tv_map)} missing={len(missing)}")
 
-    if listing is None or len(listing) == 0:
-        raise RuntimeError("StockListing('KRX') returned empty.")
-
-    needed = {"Ticker", "Market", "Close", "Marcap"}
-    missing = [c for c in needed if c not in listing.columns]
     if missing:
-        raise RuntimeError(f"Listing missing columns: {missing}. Available={list(listing.columns)}")
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(_fetch_traded_value_20d, c): c for c in missing}
+            done = 0
+            for fut in as_completed(futs):
+                res = fut.result()
+                done += 1
+                if done % 250 == 0:
+                    print(f"[PROGRESS] {done}/{len(missing)}")
+                if res is None:
+                    continue
+                code, tv = res
+                tv_map[code] = tv
 
-    df = listing.copy()
-    df = df[df["Market"].isin(rules.markets)].copy()
+    # 3) assemble final df
+    listing["TradedValue20D"] = listing["Code"].map(tv_map)
+    listing = listing.dropna(subset=["TradedValue20D"])
+    listing["TradedValue20D"] = listing["TradedValue20D"].astype(float)
 
-    # numeric
-    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-    df["Marcap"] = pd.to_numeric(df["Marcap"], errors="coerce")
+    # 4) select top 1200
+    top = listing.sort_values("TradedValue20D", ascending=False).head(1200).reset_index(drop=True)
 
-    # optional Amount filter
-    if "Amount" in df.columns:
-        df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
-    else:
-        df["Amount"] = pd.NA
+    # 5) backup existing universe
+    if UNIVERSE_PATH.exists():
+        backup_path = BACKUP_DIR / f"universe_{_now_kst()}.txt"
+        backup_path.write_text(UNIVERSE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
 
-    df = df.dropna(subset=["Ticker", "Close", "Marcap"])
-    df = df[df["Close"] >= float(rules.min_price_krw)]
+    # 6) write universe + name map
+    UNIVERSE_PATH.write_text("\n".join(top["Code"].tolist()) + "\n", encoding="utf-8")
 
-    # top by market cap
-    df = df.sort_values("Marcap", ascending=False).head(int(rules.top_n_mcap))
+    # name map for nicer output
+    import json
+    name_map = {r["Code"]: r["Name"] for _, r in top.iterrows()}
+    NAME_MAP_PATH.write_text(json.dumps(name_map, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # liquidity prefilter by today's Amount if available
-    if df["Amount"].notna().any():
-        df = df[df["Amount"].fillna(0) >= float(rules.min_amount_krw_today)]
+    # persist build cache (all codes we have)
+    cache_df = pd.DataFrame([{"Code": c, "TradedValue20D": tv} for c, tv in tv_map.items()])
+    cache_df.to_csv(BUILD_CACHE, index=False, encoding="utf-8")
 
-    df = df.sort_values(["Marcap"], ascending=False)
-
-    return asof, df
-
-
-def main() -> int:
-    root = _repo_root()
-    rules_path = root / "config" / "universe_rules.json"
-    universe_path = root / "config" / "universe.txt"
-    backup_dir = root / "state" / "universe_backup"
-
-    rules = _load_rules(rules_path)
-    run_ymd = _today_yyyymmdd_kst()
-
-    print("[INFO] data_source=FinanceDataReader")
-    _backup_universe(universe_path, backup_dir, run_ymd)
-
-    try:
-        asof, df_final = build_universe(rules)
-        tickers = df_final["Ticker"].astype(str).tolist()
-
-        if len(tickers) < int(rules.min_count_valid):
-            raise RuntimeError(f"Universe too small ({len(tickers)}). Treat as failure and keep previous universe.")
-
-        _save_universe(universe_path, tickers)
-
-        print(f"[OK] asof={asof} markets={rules.markets}")
-        print(f"[OK] universe_size={len(tickers)} (top_n_mcap={rules.top_n_mcap}, min_price_krw={rules.min_price_krw:,}, "
-              f"min_amount_krw_today={rules.min_amount_krw_today:,})")
-
-        preview = df_final.head(10).copy()
-        cols = ["Ticker", "Name"] if "Name" in preview.columns else ["Ticker"]
-        cols += ["Close", "Marcap"]
-        if "Amount" in preview.columns:
-            cols += ["Amount"]
-        print("[TOP10]")
-        print(preview[cols].to_string(index=False))
-
-        return 0
-
-    except Exception as e:
-        print(f"[FAIL] update_universe: {e}", file=sys.stderr)
-        print("[FAIL] Keeping previous universe.txt (backup already created).", file=sys.stderr)
-        return 1
-
+    print(f"[OK] universe written: {UNIVERSE_PATH} (count={len(top)})")
+    print(f"[OK] name_map written: {NAME_MAP_PATH} (count={len(name_map)})")
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
