@@ -30,10 +30,9 @@ jobs:
           restore-keys: |
             krx-signal-forge-state-${{ github.ref }}-
 
-      - name: Weekly universe update (Mon)
-        if: ${{ github.event_name == 'schedule' && contains('1', format('{0}', github.event.schedule)) }}
-        run: |
-          python scripts/update_universe.py
+      - name: Daily universe update
+            run: |
+              python scripts/update_universe.py
 
       - name: Ensure universe exists
         run: |
