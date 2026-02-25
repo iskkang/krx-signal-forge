@@ -1,20 +1,26 @@
-# krx-signal-forge
+# krx-signal-forge-fdr
 
-KOSPI+KOSDAQ practical universe + swing scan skeleton (GitHub Actions friendly).
+KR universe + swing scan using **FinanceDataReader** (PyKRX-free).
 
-## What this repo does
-- Builds **KOSPI+KOSDAQ** universe using PyKRX:
+## Why
+KRX data endpoints moved toward login/membership flows, which frequently breaks scrapers (PyKRX). citeturn0search0  
+So this repo uses FinanceDataReader as the data adapter. citeturn0search1
+
+> Note: FinanceDataReader also depends on upstream sources (KRX/NAVER/etc.), so we keep **cache + rollback + validation** for universe stability. citeturn0search6turn0search10
+
+## What it does
+- Universe build (KOSPI+KOSDAQ):
   - market cap Top 1200
-  - 20D average turnover filter (KRW)
-  - price floor filter
-  - backups + rollback guard against PyKRX/KRX hiccups
-- Runs a daily scan with a **G1/G2/G3** gate structure:
-  - G1: price + turnover + history length
-  - G2: MA200 trend + EMA20 reclaim setup (+ EMA alignment)
-  - G3: volume spike + N-day breakout trigger
-- Saves `state/last_signals.json` to suppress duplicate HARD alerts.
+  - price floor
+  - liquidity prefilter using listing `Amount` (if available)
+  - backups + rollback if build output is too small
+- Daily scan (G1/G2/G3):
+  - G1 uses **20D turnover (approx = close*volume)** from fetched OHLCV
+  - G2 trend + EMA reclaim setup
+  - G3 volume spike + breakout trigger
+- Suppresses duplicate HARD alerts via `state/last_signals.json`
 
-## Quickstart (local)
+## Quickstart
 ```bash
 pip install -r requirements.txt
 python scripts/update_universe.py
@@ -22,19 +28,9 @@ python -m src.runner
 ```
 
 ## Config
-- `config/universe_rules.json` : universe build rules
-- `config/scan_rules.json` : scan rules + optional telegram
+- `config/universe_rules.json`
+- `config/scan_rules.json`
 
-## Telegram (optional)
-1) Set in `config/scan_rules.json`:
-   - `"telegram": { "enabled": true, ... }`
-2) Add GitHub Secrets:
-   - `TELEGRAM_TOKEN`
-   - `TELEGRAM_CHAT_ID`
-
-## Notes about PyKRX reliability
-- PyKRX can break when KRX changes pages/login flow.
-- This repo protects you by:
-  - always creating a backup first
-  - validating minimum universe size
-  - keeping previous `universe.txt` on failure
+## GitHub Actions
+- `Update KRX Universe (FDR)` : KST 07:10
+- `Daily KRX Scan (FDR)` : KST 16:20

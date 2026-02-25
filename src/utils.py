@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from pykrx import stock
+import FinanceDataReader as fdr
 
 KST = timezone(timedelta(hours=9))
 
@@ -40,6 +40,9 @@ def save_json(path: Path, obj: Any) -> None:
 
 
 def pick_last_trading_day_kst(target_yyyymmdd: Optional[str] = None, max_back: int = 21) -> str:
+    """
+    FDR 기반 거래일 탐색: 삼성전자(005930)가 1개라도 조회되면 거래일로 간주.
+    """
     if target_yyyymmdd is None or target_yyyymmdd == "auto":
         base = datetime.now(KST).date()
     else:
@@ -50,9 +53,10 @@ def pick_last_trading_day_kst(target_yyyymmdd: Optional[str] = None, max_back: i
         d = base - timedelta(days=i)
         ymd = d.strftime("%Y%m%d")
         try:
-            t = stock.get_market_ticker_list(ymd, market="KOSPI")
-            if isinstance(t, list) and len(t) > 0:
+            df = fdr.DataReader("005930", ymd, ymd)
+            if df is not None and len(df) > 0:
                 return ymd
         except Exception as e:
             last_exc = e
+            continue
     raise RuntimeError(f"Could not find a recent trading day (last_exc={last_exc}).")

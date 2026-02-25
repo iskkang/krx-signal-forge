@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import pandas as pd
-from pykrx import stock
+import FinanceDataReader as fdr
 
 
 @dataclass
@@ -20,40 +20,36 @@ def fetch_ohlcv(
     lookback_days: int = 420,
 ) -> Optional[KRXBars]:
     """
-    Fetch OHLCV+turnover (KRW) for a single ticker.
-
-    Returns df with columns:
-      open, high, low, close, volume, turnover
+    FinanceDataReader 기반 OHLCV.
+    - 컬럼: Open/High/Low/Close/Volume (일반적으로 제공)
+    - turnover는 close*volume으로 근사 (거래대금 컬럼이 없기 때문)
     """
     end_dt = datetime.strptime(end_yyyymmdd, "%Y%m%d")
-    start_dt = end_dt - timedelta(days=int(lookback_days * 2.2))  # holiday buffer
-    start = start_dt.strftime("%Y%m%d")
-    end = end_dt.strftime("%Y%m%d")
+    start_dt = end_dt - timedelta(days=int(lookback_days * 2.2))
+    start = start_dt.strftime("%Y-%m-%d")
+    end = end_dt.strftime("%Y-%m-%d")
 
     try:
-        raw = stock.get_market_ohlcv_by_date(start, end, ticker)
+        raw = fdr.DataReader(ticker, start, end)
         if raw is None or len(raw) == 0:
             return None
 
-        required = {"시가", "고가", "저가", "종가", "거래량"}
-        if not required.issubset(set(raw.columns)):
-            return None
-
+        # 표준화
         df = pd.DataFrame(index=raw.index.copy())
-        df["open"] = raw["시가"].astype("float64")
-        df["high"] = raw["고가"].astype("float64")
-        df["low"] = raw["저가"].astype("float64")
-        df["close"] = raw["종가"].astype("float64")
-        df["volume"] = raw["거래량"].astype("float64")
+        for c in ["Open", "High", "Low", "Close", "Volume"]:
+            if c not in raw.columns:
+                return None
 
-        if "거래대금" in raw.columns:
-            df["turnover"] = raw["거래대금"].astype("float64")
-        else:
-            df["turnover"] = df["close"] * df["volume"]
+        df["open"] = pd.to_numeric(raw["Open"], errors="coerce").astype("float64")
+        df["high"] = pd.to_numeric(raw["High"], errors="coerce").astype("float64")
+        df["low"] = pd.to_numeric(raw["Low"], errors="coerce").astype("float64")
+        df["close"] = pd.to_numeric(raw["Close"], errors="coerce").astype("float64")
+        df["volume"] = pd.to_numeric(raw["Volume"], errors="coerce").astype("float64")
 
         df = df.dropna()
-        df = df.tail(int(lookback_days))
+        df["turnover"] = df["close"] * df["volume"]
 
+        df = df.tail(int(lookback_days))
         if len(df) < int(lookback_days * 0.7):
             return None
 

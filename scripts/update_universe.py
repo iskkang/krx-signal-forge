@@ -9,23 +9,25 @@ from pathlib import Path
 from typing import Optional, List
 
 import pandas as pd
-from pykrx import stock
-import pykrx
+import FinanceDataReader as fdr
 
 KST = timezone(timedelta(hours=9))
 
 
 @dataclass
 class Rules:
-    market: str = "ALL"  # "KOSPI" | "KOSDAQ" | "ALL"
-    asof: str = "auto"   # "YYYYMMDD" or "auto"
+    asof: str = "auto"  # "YYYYMMDD" or "auto"
+    markets: List[str] = None  # ["KOSPI","KOSDAQ"]
     top_n_mcap: int = 1200
-
-    turnover_lookback: int = 20
-    min_turnover_krw_20d: int = 5_000_000_000  # 50억
-
     min_price_krw: int = 2000
+    # Universe 단계에서는 20D 평균 거래대금 대신, listing에 있는 'Amount'(당일 거래대금)로 1차 필터
+    min_amount_krw_today: int = 5_000_000_000
     min_count_valid: int = 700
+    listing_cache_days: int = 3
+
+    def __post_init__(self):
+        if self.markets is None:
+            self.markets = ["KOSPI", "KOSDAQ"]
 
 
 def _repo_root() -> Path:
@@ -41,69 +43,10 @@ def _today_yyyymmdd_kst() -> str:
     return datetime.now(KST).strftime("%Y%m%d")
 
 
-def _is_trading_day(yyyymmdd: str) -> bool:
-    """Fast trading-day check: KOSPI tickers non-empty."""
-    t = stock.get_market_ticker_list(yyyymmdd, market="KOSPI")
-    return isinstance(t, list) and len(t) > 0
-
-
-def _pick_last_trading_day_kst(target: Optional[str] = None, max_back: int = 21) -> str:
-    if target is None:
-        base = datetime.now(KST).date()
-    else:
-        base = datetime.strptime(target, "%Y%m%d").date()
-
-    last_exc: Optional[Exception] = None
-    for i in range(max_back):
-        d = base - timedelta(days=i)
-        ymd = d.strftime("%Y%m%d")
-        try:
-            if _is_trading_day(ymd):
-                return ymd
-        except Exception as e:
-            last_exc = e
-
-    raise RuntimeError(f"Could not find a recent trading day (last_exc={last_exc}).")
-
-
-def _get_last_n_trading_days(end_yyyymmdd: str, n: int, max_back: int = 120) -> List[str]:
-    """
-    Returns a list of last N trading days (ascending), ending at end_yyyymmdd (or earlier if end isn't trading day).
-    Uses get_market_ohlcv_by_ticker which is much cheaper than per-ticker calls.
-    """
-    end_td = _pick_last_trading_day_kst(end_yyyymmdd)
-    end_date = datetime.strptime(end_td, "%Y%m%d").date()
-
-    days: List[str] = []
-    checked = 0
-    i = 0
-    last_exc: Optional[Exception] = None
-    while len(days) < n and checked < max_back:
-        d = end_date - timedelta(days=i)
-        i += 1
-        checked += 1
-        ymd = d.strftime("%Y%m%d")
-        try:
-            # This call fails/returns empty on non-trading days.
-            df = stock.get_market_ohlcv_by_ticker(date=ymd, market="KOSPI")
-            if df is None or len(df) == 0:
-                continue
-            days.append(ymd)
-        except Exception as e:
-            last_exc = e
-            continue
-
-    if len(days) < n:
-        raise RuntimeError(f"Could not collect {n} trading days within lookback. got={len(days)} last_exc={last_exc}")
-
-    return sorted(days)  # ascending
-
-
 def _backup_universe(universe_path: Path, backup_dir: Path, ymd: str) -> None:
     backup_dir.mkdir(parents=True, exist_ok=True)
     if universe_path.exists() and universe_path.read_text(encoding="utf-8").strip():
-        backup_path = backup_dir / f"universe_{ymd}.txt"
-        backup_path.write_text(universe_path.read_text(encoding="utf-8"), encoding="utf-8")
+        (backup_dir / f"universe_{ymd}.txt").write_text(universe_path.read_text(encoding="utf-8"), encoding="utf-8")
 
 
 def _save_universe(universe_path: Path, tickers: list[str]) -> None:
@@ -111,46 +54,130 @@ def _save_universe(universe_path: Path, tickers: list[str]) -> None:
     universe_path.write_text("\n".join(tickers) + "\n", encoding="utf-8")
 
 
-def build_universe(rules: Rules) -> tuple[str, pd.DataFrame]:
-    # 1) asof
-    asof = _pick_last_trading_day_kst(None if rules.asof == "auto" else rules.asof)
-
-    # 2) market cap table (single call)
-    mcap_df = stock.get_market_cap_by_ticker(asof, market=rules.market)
-    if mcap_df is None or len(mcap_df) == 0:
-        raise RuntimeError("market cap dataframe is empty")
-
-    if "종가" not in mcap_df.columns or "시가총액" not in mcap_df.columns:
-        raise RuntimeError(f"Unexpected columns in mcap_df: {list(mcap_df.columns)}")
-
-    df = pd.DataFrame(index=mcap_df.index.copy())
-    df["price"] = mcap_df["종가"].astype("float64")
-    df["mcap"] = mcap_df["시가총액"].astype("float64")
-
-    # 3) Top N by mcap
-    df = df.sort_values("mcap", ascending=False).head(int(rules.top_n_mcap))
-    tickers = df.index.tolist()
-
-    # 4) Turnover 20D avg (bulk, 20 calls instead of 1200 calls)
-    trading_days = _get_last_n_trading_days(asof, int(rules.turnover_lookback))
-    tv_sum = pd.Series(0.0, index=tickers)
-
-    for day in trading_days:
-        # market-wide ohlcv for the day; includes 거래대금
-        day_df = stock.get_market_ohlcv_by_ticker(date=day, market=rules.market)
-        if day_df is None or len(day_df) == 0 or "거래대금" not in day_df.columns:
+def _asof_auto() -> str:
+    """
+    FDR은 '거래일 캘린더'를 직접 주지 않으니,
+    오늘부터 역으로 14일 탐색하면서 삼성전자 데이터가 1개라도 나오는 날짜를 거래일로 간주.
+    """
+    base = datetime.now(KST).date()
+    for i in range(14):
+        d = base - timedelta(days=i)
+        ymd = d.strftime("%Y%m%d")
+        try:
+            df = fdr.DataReader("005930", ymd, ymd)
+            if df is not None and len(df) > 0:
+                return ymd
+        except Exception:
             continue
-        sub = day_df.reindex(tickers)
-        tv = sub["거래대금"].astype("float64").fillna(0.0)
-        tv_sum = tv_sum.add(tv, fill_value=0.0)
+    # 최후: 그냥 어제로
+    return (base - timedelta(days=1)).strftime("%Y%m%d")
 
-    df["turnover_krw_20d"] = (tv_sum / float(rules.turnover_lookback)).astype("float64")
 
-    # 5) filters
-    df = df[df["price"] >= float(rules.min_price_krw)]
-    df = df[df["turnover_krw_20d"] >= float(rules.min_turnover_krw_20d)]
+def _norm_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    FinanceDataReader.StockListing('KRX') 컬럼은 버전/소스에 따라 달라질 수 있어
+    가능한 키를 모두 흡수해 표준화한다.
+    """
+    out = df.copy()
+    # code/symbol
+    if "Code" in out.columns:
+        out.rename(columns={"Code": "Ticker"}, inplace=True)
+    elif "Symbol" in out.columns:
+        out.rename(columns={"Symbol": "Ticker"}, inplace=True)
+    elif "ticker" in out.columns:
+        out.rename(columns={"ticker": "Ticker"}, inplace=True)
 
-    df = df.sort_values(["mcap", "turnover_krw_20d"], ascending=False)
+    # market
+    if "Market" not in out.columns and "MarketId" in out.columns:
+        out.rename(columns={"MarketId": "Market"}, inplace=True)
+
+    # price (Close)
+    if "Close" not in out.columns:
+        for c in ["Price", "Last", "종가"]:
+            if c in out.columns:
+                out.rename(columns={c: "Close"}, inplace=True)
+                break
+
+    # market cap
+    if "Marcap" not in out.columns:
+        for c in ["MarketCap", "시가총액", "MarCap"]:
+            if c in out.columns:
+                out.rename(columns={c: "Marcap"}, inplace=True)
+                break
+
+    # amount (trading value)
+    if "Amount" not in out.columns:
+        for c in ["거래대금", "Value", "TrValue"]:
+            if c in out.columns:
+                out.rename(columns={c: "Amount"}, inplace=True)
+                break
+
+    return out
+
+
+def _load_listing_cached(cache_path: Path, max_age_days: int) -> Optional[pd.DataFrame]:
+    if not cache_path.exists():
+        return None
+    try:
+        st = cache_path.stat()
+        age = datetime.now(KST) - datetime.fromtimestamp(st.st_mtime, tz=KST)
+        if age > timedelta(days=max_age_days):
+            return None
+        return pd.read_parquet(cache_path)
+    except Exception:
+        return None
+
+
+def _save_listing_cache(cache_path: Path, df: pd.DataFrame) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_path, index=False)
+
+
+def build_universe(rules: Rules) -> tuple[str, pd.DataFrame]:
+    asof = _asof_auto() if rules.asof == "auto" else rules.asof
+
+    # listing cache
+    root = _repo_root()
+    cache_path = root / "state" / "cache" / "krx_listing.parquet"
+    listing = _load_listing_cached(cache_path, rules.listing_cache_days)
+    if listing is None:
+        listing = fdr.StockListing("KRX")
+        listing = _norm_columns(listing)
+        _save_listing_cache(cache_path, listing)
+
+    if listing is None or len(listing) == 0:
+        raise RuntimeError("StockListing('KRX') returned empty.")
+
+    needed = {"Ticker", "Market", "Close", "Marcap"}
+    missing = [c for c in needed if c not in listing.columns]
+    if missing:
+        raise RuntimeError(f"Listing missing columns: {missing}. Available={list(listing.columns)}")
+
+    df = listing.copy()
+    df = df[df["Market"].isin(rules.markets)].copy()
+
+    # numeric
+    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+    df["Marcap"] = pd.to_numeric(df["Marcap"], errors="coerce")
+
+    # optional Amount filter
+    if "Amount" in df.columns:
+        df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
+    else:
+        df["Amount"] = pd.NA
+
+    df = df.dropna(subset=["Ticker", "Close", "Marcap"])
+    df = df[df["Close"] >= float(rules.min_price_krw)]
+
+    # top by market cap
+    df = df.sort_values("Marcap", ascending=False).head(int(rules.top_n_mcap))
+
+    # liquidity prefilter by today's Amount if available
+    if df["Amount"].notna().any():
+        df = df[df["Amount"].fillna(0) >= float(rules.min_amount_krw_today)]
+
+    df = df.sort_values(["Marcap"], ascending=False)
+
     return asof, df
 
 
@@ -163,30 +190,29 @@ def main() -> int:
     rules = _load_rules(rules_path)
     run_ymd = _today_yyyymmdd_kst()
 
-    print(f"[INFO] pykrx_version={pykrx.__version__}")
+    print("[INFO] data_source=FinanceDataReader")
     _backup_universe(universe_path, backup_dir, run_ymd)
 
     try:
         asof, df_final = build_universe(rules)
-        tickers = df_final.index.tolist()
+        tickers = df_final["Ticker"].astype(str).tolist()
 
         if len(tickers) < int(rules.min_count_valid):
             raise RuntimeError(f"Universe too small ({len(tickers)}). Treat as failure and keep previous universe.")
 
         _save_universe(universe_path, tickers)
 
-        print(f"[OK] asof={asof} market={rules.market}")
-        print(
-            f"[OK] universe_size={len(tickers)} "
-            f"(top_n_mcap={rules.top_n_mcap}, lookback={rules.turnover_lookback}, "
-            f"min_turnover_krw_20d={rules.min_turnover_krw_20d:,}, min_price_krw={rules.min_price_krw:,})"
-        )
+        print(f"[OK] asof={asof} markets={rules.markets}")
+        print(f"[OK] universe_size={len(tickers)} (top_n_mcap={rules.top_n_mcap}, min_price_krw={rules.min_price_krw:,}, "
+              f"min_amount_krw_today={rules.min_amount_krw_today:,})")
 
         preview = df_final.head(10).copy()
-        preview["mcap"] = preview["mcap"].round(0).astype("int64")
-        preview["turnover_krw_20d"] = preview["turnover_krw_20d"].round(0).astype("int64")
-        print("[TOP10] ticker price mcap turnover_krw_20d")
-        print(preview[["price", "mcap", "turnover_krw_20d"]].to_string())
+        cols = ["Ticker", "Name"] if "Name" in preview.columns else ["Ticker"]
+        cols += ["Close", "Marcap"]
+        if "Amount" in preview.columns:
+            cols += ["Amount"]
+        print("[TOP10]")
+        print(preview[cols].to_string(index=False))
 
         return 0
 

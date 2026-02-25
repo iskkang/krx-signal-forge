@@ -1,7 +1,6 @@
 {
   "asof": "auto",
   "lookback_days": 420,
-  "max_workers": 6,
   "g1": {
     "min_price_krw": 2000,
     "min_turnover_krw_20d": 5000000000,
@@ -11,7 +10,6 @@
     "trend_ma_days": 200,
     "ema_fast_days": 20,
     "ema_mid_days": 50,
-    "ema_slow_days": 200,
     "require_close_above_ma200": true,
     "reclaim_within_days": 3
   },
