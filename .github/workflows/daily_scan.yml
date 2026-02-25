@@ -1,0 +1,34 @@
+name: Daily KRX Scan
+
+on:
+  workflow_dispatch:
+  schedule:
+    # KST 16:20 = UTC 07:20
+    - cron: "20 7 * * 1-5"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scan
+        run: |
+          python -m src.runner
+
+      - name: Commit state (last_signals.json)
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add state/last_signals.json || true
+          git commit -m "Update scan state" || echo "No changes to commit"
+          git push || true
