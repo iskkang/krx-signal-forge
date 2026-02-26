@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import os
 import requests
 
@@ -12,7 +13,6 @@ def send_message(text: str) -> None:
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-
     try:
         r = requests.post(
             url,
@@ -20,7 +20,6 @@ def send_message(text: str) -> None:
                 "chat_id": chat_id,
                 "text": text,
                 "disable_web_page_preview": True,
-                # "parse_mode": "Markdown"  # 필요하면 주석 해제
             },
             timeout=15,
         )

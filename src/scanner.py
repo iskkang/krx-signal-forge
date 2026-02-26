@@ -4,17 +4,8 @@ from dataclasses import dataclass
 from typing import Dict, Any
 import pandas as pd
 
-from .scan.gates import gate_setup_pullback
-from .scan.gates import gate_history, gate_liquidity, gate_volatility, gate_trend_ma200
+from .scan.gates import gate_history, gate_liquidity, gate_volatility, gate_trend_ma200, gate_setup_pullback
 from .scan.strategy import eval_ema20_reclaim_with_volume, SignalEval
-
-from .scan.gates import (
-    gate_history,
-    gate_liquidity,
-    gate_volatility,
-    gate_trend_ma200,
-    gate_setup_pullback,
-)
 
 @dataclass
 class Candidate:
@@ -59,32 +50,30 @@ def scan_one(ticker: str, name: str, df: pd.DataFrame, settings: dict[str, Any],
             drop[g.reason] = drop.get(g.reason, 0) + 1
             return out
 
-        tf = settings["trend_filter"]
+    tf = settings["trend_filter"]
     if tf.get("enabled", True) and tf.get("ma200_required", True):
         g = gate_trend_ma200(df)
         if not g.ok:
             drop[g.reason] = drop.get(g.reason, 0) + 1
             return out
 
-    # =========================
-    # G2: SETUP (눌림 구조 필터)
-    # =========================
-    g = gate_setup_pullback(
-        df,
-        max_day_ret_pct=8.0,      # 당일 급등 컷
-        max_gap_pct=4.0,          # 갭상승 컷
-        ema20_band_pct=3.0,       # EMA20 근처만 허용
-        max_extended_pct=6.0,     # 과도한 이격 컷
-        hh_lookback=60,
-        min_from_hh_pct=85.0      # 바닥 반등 제거
-    )
-    if not g.ok:
-        drop[g.reason] = drop.get(g.reason, 0) + 1
-        return out
 
-    # =========================
-    # G3: SIGNAL (트리거)
-    # =========================
+    sf = settings.get("setup_filter", {})
+    if sf.get("enabled", True):
+        g = gate_setup_pullback(
+            df,
+            max_day_ret_pct=float(sf.get("max_day_ret_pct", 8.0)),
+            max_gap_pct=float(sf.get("max_gap_pct", 4.0)),
+            ema20_band_pct=float(sf.get("ema20_band_pct", 3.0)),
+            max_extended_pct=float(sf.get("max_extended_pct", 6.0)),
+            hh_lookback=int(sf.get("hh_lookback", 60)),
+            min_from_hh_pct=float(sf.get("min_from_hh_pct", 85.0)),
+        )
+        if not g.ok:
+            drop[g.reason] = drop.get(g.reason, 0) + 1
+            return out
+
+
     st = settings["strategy"]
     sig = eval_ema20_reclaim_with_volume(
         df,

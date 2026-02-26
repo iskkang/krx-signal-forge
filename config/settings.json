@@ -30,5 +30,22 @@
   },
   "telegram": {
     "enabled": true
+  },
+  "trade_plan": {
+    "entry_mode": "close_buffer_pct",
+    "entry_buffer_pct": 0.3,
+    "max_gap_pct": 2.0,
+    "stop_atr_mult": 1.5,
+    "tp1_r_multiple": 2.0,
+    "soft_watch_expire_days": 14
+  },
+  "setup_filter": {
+    "enabled": true,
+    "max_day_ret_pct": 8.0,
+    "max_gap_pct": 4.0,
+    "ema20_band_pct": 3.0,
+    "max_extended_pct": 6.0,
+    "hh_lookback": 60,
+    "min_from_hh_pct": 85.0
   }
 }
