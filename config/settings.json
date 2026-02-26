@@ -29,6 +29,6 @@
     "max_soft": 15
   },
   "telegram": {
-    "enabled": false
+    "enabled": true
   }
 }
