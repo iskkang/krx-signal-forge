@@ -8,6 +8,14 @@ from .scan.gates import gate_setup_pullback
 from .scan.gates import gate_history, gate_liquidity, gate_volatility, gate_trend_ma200
 from .scan.strategy import eval_ema20_reclaim_with_volume, SignalEval
 
+from .scan.gates import (
+    gate_history,
+    gate_liquidity,
+    gate_volatility,
+    gate_trend_ma200,
+    gate_setup_pullback,
+)
+
 @dataclass
 class Candidate:
     ticker: str
