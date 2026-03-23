@@ -12,7 +12,7 @@ class GateResult:
 
 
 # ─────────────────────────────────────────────
-# 기존 게이트 (유지 + 정리)
+# 기본 게이트
 # ─────────────────────────────────────────────
 
 def gate_history(df: pd.DataFrame, min_bars: int) -> GateResult:
@@ -57,19 +57,37 @@ def gate_trend_ma200(df: pd.DataFrame) -> GateResult:
     return GateResult(True, "ok")
 
 
+def gate_ema20_slope(
+    df: pd.DataFrame,
+    min_slope_pct: float = 0.0,
+    lookback: int = 10,
+) -> GateResult:
+    """EMA20이 우상향 중인지 확인.
+    min_slope_pct=0.0 이면 하락 EMA20만 제거 (수평은 허용).
+    """
+    slope = ema_slope_pct(df["Close"], 20, lookback=lookback)
+    if slope < min_slope_pct:
+        return GateResult(False, "ema20_not_rising")
+    return GateResult(True, "ok")
+
+
 def gate_setup_pullback(
     df: pd.DataFrame,
     max_day_ret_pct: float = 8.0,
     max_gap_pct: float = 4.0,
-    ema20_band_pct: float = 3.0,
+    max_extended_pct: float = 8.0,
+    max_below_ema20_pct: float = 10.0,
     hh_lookback: int = 60,
     min_from_hh_pct: float = 80.0,
 ) -> GateResult:
-    """당일 급등·갭업 스파이크 제거 + 60일 고점 근처 확인.
+    """사전 필터: 스파이크·갭업 제거 + EMA20 근방 확인 + 60일 고점 근처 확인.
 
-    v2 변경: 중복 추세 체크(MA200, EMA스택) 제거.
-    max_extended_pct 제거 (ema20_band_pct 안에 이미 포함됨).
-    min_from_hh_pct 85% → 80% 로 완화 (좋은 눌림목 포착).
+    v3 핵심 수정 — ema20_band_pct(대칭) → 비대칭 구조로 변경:
+      • 하락 방향: close가 EMA20 아래 max_below_ema20_pct(10%) 초과면 제거
+                   (너무 멀리 떨어져 있어 당일 재탈환 불가)
+      • 상승 방향: close가 EMA20 위 max_extended_pct(8%) 초과면 제거
+                   (이미 많이 올라 추격매수 위험)
+      이렇게 하면 강한 재탈환 캔들(종가 EMA20 +3~6%)이 살아남는다.
     """
     need = max(hh_lookback, 200) + 5
     if df is None or df.empty or len(df) < need:
@@ -91,9 +109,15 @@ def gate_setup_pullback(
     if ema20_v <= 0:
         return GateResult(False, "setup_ma_nan")
 
-    band = abs(c - ema20_v) / ema20_v * 100.0
-    if band > ema20_band_pct:
-        return GateResult(False, "setup_not_near_ema20")
+    deviation = (c - ema20_v) / ema20_v * 100.0  # 양수=위, 음수=아래
+
+    if deviation < -max_below_ema20_pct:
+        # EMA20 아래로 너무 멀리 — 당일 재탈환 불가능
+        return GateResult(False, "setup_too_far_below_ema20")
+
+    if deviation > max_extended_pct:
+        # EMA20 위로 너무 높이 — 이미 과열, 추격 위험
+        return GateResult(False, "setup_too_extended")
 
     hh = float(df["Close"].tail(hh_lookback).max())
     if hh <= 0:
@@ -105,22 +129,40 @@ def gate_setup_pullback(
 
 
 # ─────────────────────────────────────────────
-# 신규 게이트 (A+ 업그레이드)
+# strategy eval 이후 게이트 (reclaim 발생 확인 후)
 # ─────────────────────────────────────────────
 
-def gate_ema20_slope(
+def gate_reclaim_candle(
     df: pd.DataFrame,
-    min_slope_pct: float = 0.5,
-    lookback: int = 10,
+    min_close_pct: float = 0.55,
+    min_body_ratio: float = 0.35,
 ) -> GateResult:
-    """EMA20이 우상향 중인지 확인.
+    """재탈환 캔들 강도 검증 (strategy eval 이후에만 호출).
 
-    수평·하락 EMA20 위에서의 재탈환은 가짜 신호 비율이 높다.
-    min_slope_pct: 10거래일간 EMA20 상승률 최솟값(%).
+    조건:
+      1) 양봉 (close > open)
+      2) 종가가 당일 범위 상위 45% 이상에 위치
+      3) 캔들 몸통이 전체 범위 35% 이상
     """
-    slope = ema_slope_pct(df["Close"], 20, lookback=lookback)
-    if slope < min_slope_pct:
-        return GateResult(False, "ema20_not_rising")
+    o = float(df["Open"].iloc[-1])
+    h = float(df["High"].iloc[-1])
+    l = float(df["Low"].iloc[-1])
+    c = float(df["Close"].iloc[-1])
+
+    bar_range = h - l
+    if bar_range <= 0:
+        return GateResult(False, "zero_range_candle")
+    if c <= o:
+        return GateResult(False, "bearish_reclaim_candle")
+
+    close_pct = (c - l) / bar_range
+    if close_pct < min_close_pct:
+        return GateResult(False, "weak_close_position")
+
+    body_ratio = abs(c - o) / bar_range
+    if body_ratio < min_body_ratio:
+        return GateResult(False, "small_body_candle")
+
     return GateResult(True, "ok")
 
 
@@ -131,19 +173,18 @@ def gate_pullback_quality(
     max_vol_ratio: float = 0.85,
     max_depth_pct: float = 15.0,
 ) -> GateResult:
-    """눌림 품질 검증.
+    """눌림 품질 검증 (strategy eval 이후에만 호출).
 
-    건강한 눌림의 3가지 조건:
-      1) 기간: 너무 짧거나(1일 노이즈) 너무 길지 않아야 한다
-      2) 거래량: 눌림 중 거래량이 VMA20 대비 줄어야 한다 (매도 압력 약함)
-      3) 깊이: 직전 고점 대비 15% 이내 눌림 (추세 훼손 없음)
+    건강한 눌림 3조건:
+      1) 기간 2~20일 (너무 짧으면 노이즈, 너무 길면 추세 훼손)
+      2) 눌림 중 거래량 VMA20 대비 85% 이하 (조용한 매도)
+      3) 직전 고점 대비 낙폭 15% 이내
     """
     close = df["Close"]
     vol = df["Volume"]
     e = ema(close, 20)
     v20 = sma(vol, 20)
 
-    # 어제(iloc[-2])부터 역방향으로 EMA 아래 연속 봉 수집
     pb_idx: list[int] = []
     for i in range(len(df) - 2, max(0, len(df) - 2 - max_days - 5), -1):
         if close.iloc[i] <= e.iloc[i]:
@@ -163,7 +204,6 @@ def gate_pullback_quality(
         if pb_vol_mean / vma_val > max_vol_ratio:
             return GateResult(False, "pullback_vol_high")
 
-    # 눌림 깊이: 직전 20봉 고점 대비 낙폭
     earliest = min(pb_idx)
     if earliest >= 1:
         pre_slice = close.iloc[max(0, earliest - 20): earliest]
@@ -178,48 +218,12 @@ def gate_pullback_quality(
     return GateResult(True, "ok")
 
 
-def gate_reclaim_candle(
-    df: pd.DataFrame,
-    min_close_pct: float = 0.60,
-    min_body_ratio: float = 0.40,
+def gate_market_regime(
+    index_df: Optional[pd.DataFrame],
+    ma_period: int = 50,
 ) -> GateResult:
-    """재탈환 캔들 강도 검증.
-
-    진짜 돌파 캔들의 특성:
-      1) 종가가 당일 범위의 상위 40% 이상에 위치 (close_pct >= 0.60)
-      2) 캔들 몸통이 전체 범위의 40% 이상 (body_ratio >= 0.40)
-      3) 양봉이어야 한다 (close > open)
-
-    윗꼬리 긴 도지, 음봉 돌파 등을 자동 제거.
-    """
-    o = float(df["Open"].iloc[-1])
-    h = float(df["High"].iloc[-1])
-    l = float(df["Low"].iloc[-1])
-    c = float(df["Close"].iloc[-1])
-
-    bar_range = h - l
-    if bar_range <= 0:
-        return GateResult(False, "zero_range_candle")
-
-    close_pct = (c - l) / bar_range
-    if close_pct < min_close_pct:
-        return GateResult(False, "weak_close_position")
-
-    body_ratio = abs(c - o) / bar_range
-    if body_ratio < min_body_ratio:
-        return GateResult(False, "small_body_candle")
-
-    if c <= o:
-        return GateResult(False, "bearish_reclaim_candle")
-
-    return GateResult(True, "ok")
-
-
-def gate_market_regime(index_df: Optional[pd.DataFrame], ma_period: int = 50) -> GateResult:
     """시장 레짐 필터: KOSPI 지수가 MA50 위에 있어야 한다.
-
-    지수가 MA50 아래일 때 개별주 매수 신호는 성공률이 급격히 낮아진다.
-    index_df 가 없으면 통과 처리 (데이터 미확보 시 스캔 막지 않음).
+    index_df 가 없으면 통과 처리.
     """
     if index_df is None or index_df.empty or len(index_df) < ma_period + 5:
         return GateResult(True, "no_index_data")
