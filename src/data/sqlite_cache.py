@@ -52,39 +52,27 @@ def upsert_prices(con: sqlite3.Connection, ticker: str, df: pd.DataFrame) -> int
     return len(recs)
 
 
-def load_prices(
-    con: sqlite3.Connection,
-    ticker: str,
-    limit: int = 400,
-    max_stale_days: int = 6,
-) -> pd.DataFrame:
-    """가격 데이터 로드 + 캐시 신선도 검증.
+def load_prices(con: sqlite3.Connection, ticker: str, limit: int = 400) -> pd.DataFrame:
+    """최신 limit 행을 날짜 오름차순으로 반환.
 
-    캐시의 최신 날짜가 max_stale_days 이상 오래됐으면 빈 DF 반환.
-    → 스캐너가 stale 데이터로 잘못된 신호를 만드는 것을 방지.
+    핵심: DESC LIMIT → 최신 N행 추출 → 역순(ASC) 정렬.
+    ASC LIMIT 을 쓰면 가장 오래된 N행을 가져와 최신 데이터가 누락됨.
+    stale 체크 없음 — 신선도는 fdr_client.fetch_ohlcv에서만 검증.
     """
     q = """
         SELECT date, open, high, low, close, volume
         FROM prices
         WHERE ticker = ?
-        ORDER BY date ASC
+        ORDER BY date DESC
         LIMIT ?
     """
     rows = con.execute(q, (ticker, limit)).fetchall()
     if not rows:
         return pd.DataFrame()
-
+    rows = rows[::-1]   # DESC로 뽑은 뒤 뒤집어 ASC 순서로
     df = pd.DataFrame(rows, columns=["Date", "Open", "High", "Low", "Close", "Volume"])
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.set_index("Date")
-
-    # ── 신선도 검증 ──────────────────────────────────────────
-    latest = df.index[-1]
-    stale_days = (pd.Timestamp.now() - latest).days
-    if stale_days > max_stale_days:
-        # 캐시에 오래된 데이터가 있으면 신호 계산에 사용하지 않음
-        return pd.DataFrame()
-
     return df
 
 

@@ -279,7 +279,6 @@ def run() -> int:
     skip: Dict[str, int] = {}
     candidates: list[Candidate] = []
     lookback_bars = int(settings.get("lookback_bars", 260))
-    stale_skipped = 0
 
     for i, ticker in enumerate(universe):
         if i % 300 == 0:
@@ -288,11 +287,7 @@ def run() -> int:
         _check_timeout(f"scan {i}/{len(universe)}")
 
         try:
-            df = load_prices(con, ticker, limit=max(lookback_bars, 260), max_stale_days=6)
-            if df.empty:
-                # stale 데이터 또는 캐시 미스 — 잘못된 신호 방지
-                stale_skipped += 1
-                continue
+            df = load_prices(con, ticker, limit=max(lookback_bars, 260))
             name = name_map.get(ticker, "")
             candidates.extend(
                 scan_one(ticker, name, df, settings, drop, skip, index_df=index_df)
@@ -326,8 +321,6 @@ def run() -> int:
         f"| hard={len(hard_top)} soft={len(soft_top)} "
         f"| new_hard={len(new_hard)} | elapsed={elapsed_total:.0f}s"
     )
-    if stale_skipped:
-        print(f"[WARN] stale/캐시미스 스킵: {stale_skipped}종목 (FDR 데이터 이상 의심)")
     if not regime.ok:
         print(f"Market: {regime.reason}")
     if drop:
