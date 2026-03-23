@@ -182,7 +182,9 @@ def _fmt_telegram(
     market_reason: str,
 ) -> str:
     regime_note = "" if market_ok else f" ⚠️ 시장 약세({market_reason})"
-    lines = [f"🔔 KRX Signal Forge — 신규 HARD 시그널{regime_note}"]
+    # 기준 날짜 명시: 항상 "언제 종가 기준인지" 표시
+    scan_date = (pd.Timestamp.now("UTC") + pd.Timedelta(hours=9)).strftime("%Y-%m-%d")
+    lines = [f"🔔 KRX Signal Forge — {scan_date} 종가 기준{regime_note}"]
     for c in candidates:
         plan = compute_trade_plan(c, settings)
         m    = c.metrics
@@ -277,6 +279,7 @@ def run() -> int:
     skip: Dict[str, int] = {}
     candidates: list[Candidate] = []
     lookback_bars = int(settings.get("lookback_bars", 260))
+    stale_skipped = 0
 
     for i, ticker in enumerate(universe):
         if i % 300 == 0:
@@ -285,7 +288,11 @@ def run() -> int:
         _check_timeout(f"scan {i}/{len(universe)}")
 
         try:
-            df   = load_prices(con, ticker, limit=max(lookback_bars, 260))
+            df = load_prices(con, ticker, limit=max(lookback_bars, 260), max_stale_days=6)
+            if df.empty:
+                # stale 데이터 또는 캐시 미스 — 잘못된 신호 방지
+                stale_skipped += 1
+                continue
             name = name_map.get(ticker, "")
             candidates.extend(
                 scan_one(ticker, name, df, settings, drop, skip, index_df=index_df)
@@ -312,11 +319,15 @@ def run() -> int:
 
     # ── 콘솔 출력 ─────────────────────────────────────────
     elapsed_total = time.monotonic() - RUNNER_START
+    scan_date = (pd.Timestamp.now("UTC") + pd.Timedelta(hours=9)).strftime("%Y-%m-%d")
     print(
-        f"\nScanned: {len(universe)} | candidates: {len(candidates)} "
+        f"\n기준날짜: {scan_date} | Scanned: {len(universe)} "
+        f"| candidates: {len(candidates)} "
         f"| hard={len(hard_top)} soft={len(soft_top)} "
         f"| new_hard={len(new_hard)} | elapsed={elapsed_total:.0f}s"
     )
+    if stale_skipped:
+        print(f"[WARN] stale/캐시미스 스킵: {stale_skipped}종목 (FDR 데이터 이상 의심)")
     if not regime.ok:
         print(f"Market: {regime.reason}")
     if drop:

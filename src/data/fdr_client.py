@@ -10,6 +10,28 @@ import pandas as pd
 import FinanceDataReader as fdr
 
 
+# 데이터 신선도 허용 최대 일수 (달력일 기준)
+# 월~금 장 마감 후 실행 가정: 주말 포함 최대 4일(금→월) 허용
+_MAX_STALE_DAYS = 6
+
+
+def _validate_freshness(df: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
+    """fetch된 df의 최신 날짜가 충분히 최근인지 검증.
+
+    Returns:
+        df 그대로 반환 (유효)
+        None (데이터가 너무 오래됨 — stale 또는 FDR 오류)
+    """
+    if df is None or df.empty:
+        return None
+    latest = df.index[-1]
+    stale_days = (pd.Timestamp.now() - latest).days
+    if stale_days > _MAX_STALE_DAYS:
+        print(f"  [STALE] {ticker}: 최신 날짜 {latest.date()} ({stale_days}일 전) — 스킵")
+        return None
+    return df
+
+
 def fetch_ohlcv(
     ticker: str,
     start: str | None = None,
@@ -17,10 +39,10 @@ def fetch_ohlcv(
     retries: int = 2,
     timeout_sec: float = 12.0,
 ) -> pd.DataFrame:
-    """FinanceDataReader 로 OHLCV 조회.
+    """FinanceDataReader OHLCV 조회 + 신선도 검증.
 
-    timeout_sec: 단일 요청 최대 대기 시간. 초과 시 빈 DataFrame 반환.
-    retries: 타임아웃/에러 시 재시도 횟수 (기본 2 → 최대 3회 시도).
+    신선도 검증 실패(너무 오래된 데이터) → 빈 DataFrame 반환.
+    타임아웃 → 빈 DataFrame 반환 (무한 대기 없음).
     """
     last_err: Exception | None = None
 
@@ -40,7 +62,6 @@ def fetch_ohlcv(
         t.join(timeout=timeout_sec)
 
         if t.is_alive():
-            # 타임아웃 — 스레드는 daemon이라 메인 종료 시 자동 정리
             last_err = TimeoutError(f"FDR timeout after {timeout_sec}s for {ticker}")
             if i < retries:
                 time.sleep(0.5 * (i + 1))
@@ -62,9 +83,14 @@ def fetch_ohlcv(
         df = df.sort_index()
         if "Volume" not in df.columns:
             df["Volume"] = 0.0
-        return df
 
-    # 모든 재시도 소진
+        # ── 신선도 검증: 너무 오래된 데이터면 빈 DF 반환 ──
+        validated = _validate_freshness(df, ticker)
+        if validated is None:
+            return pd.DataFrame()
+
+        return validated
+
     return pd.DataFrame()
 
 

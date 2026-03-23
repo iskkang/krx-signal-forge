@@ -52,7 +52,17 @@ def upsert_prices(con: sqlite3.Connection, ticker: str, df: pd.DataFrame) -> int
     return len(recs)
 
 
-def load_prices(con: sqlite3.Connection, ticker: str, limit: int = 400) -> pd.DataFrame:
+def load_prices(
+    con: sqlite3.Connection,
+    ticker: str,
+    limit: int = 400,
+    max_stale_days: int = 6,
+) -> pd.DataFrame:
+    """가격 데이터 로드 + 캐시 신선도 검증.
+
+    캐시의 최신 날짜가 max_stale_days 이상 오래됐으면 빈 DF 반환.
+    → 스캐너가 stale 데이터로 잘못된 신호를 만드는 것을 방지.
+    """
     q = """
         SELECT date, open, high, low, close, volume
         FROM prices
@@ -63,9 +73,18 @@ def load_prices(con: sqlite3.Connection, ticker: str, limit: int = 400) -> pd.Da
     rows = con.execute(q, (ticker, limit)).fetchall()
     if not rows:
         return pd.DataFrame()
+
     df = pd.DataFrame(rows, columns=["Date", "Open", "High", "Low", "Close", "Volume"])
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.set_index("Date")
+
+    # ── 신선도 검증 ──────────────────────────────────────────
+    latest = df.index[-1]
+    stale_days = (pd.Timestamp.now() - latest).days
+    if stale_days > max_stale_days:
+        # 캐시에 오래된 데이터가 있으면 신호 계산에 사용하지 않음
+        return pd.DataFrame()
+
     return df
 
 
