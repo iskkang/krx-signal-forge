@@ -2,13 +2,14 @@ name: Daily KRX Scan
 
 on:
   schedule:
-    # 16:10 KST = 07:10 UTC (weekdays)
+    # 16:10 KST = 07:10 UTC (평일)
     - cron: "10 7 * * 1-5"
   workflow_dispatch:
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 15        # 15분 초과 시 GitHub가 강제 종료
 
     steps:
       - uses: actions/checkout@v4
@@ -27,13 +28,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: state
-          key: krx-signal-forge-state-${{ github.ref }}
+          key: krx-state-${{ github.ref }}-${{ github.run_id }}
           restore-keys: |
-            krx-signal-forge-state-
+            krx-state-${{ github.ref }}-
 
-      - name: Daily universe update
+      - name: Update universe (weekly on Monday)
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.event.schedule, '10 7 * * 1')
         run: |
           python scripts/update_universe.py
+        timeout-minutes: 8
 
       - name: Run scan
         env:
@@ -41,9 +44,12 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python -m src.runner
+        timeout-minutes: 10
 
       - name: Upload state artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: state
+          name: state-${{ github.run_id }}
           path: state
+          retention-days: 7
