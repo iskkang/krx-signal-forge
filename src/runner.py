@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import pandas as pd
 
@@ -13,6 +13,7 @@ from .data.sqlite_cache import connect_sqlite, ensure_schema, upsert_prices, loa
 from .data.fdr_client import fetch_ohlcv, recent_start_for_lookback
 from .scanner import scan_one, Candidate
 from .telegram_bot import send_message
+from .scan.gates import gate_market_regime
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SETTINGS_PATH = REPO_ROOT / "config" / "settings.json"
@@ -21,7 +22,6 @@ STATE_DIR.mkdir(exist_ok=True)
 
 SQLITE_PATH = STATE_DIR / "market.sqlite"
 LAST_SIGNALS_PATH = STATE_DIR / "last_signals.json"
-SOFT_WATCHLIST_PATH = STATE_DIR / "soft_watchlist.json"
 
 
 def load_settings() -> dict[str, Any]:
@@ -39,8 +39,17 @@ def load_name_map() -> dict[str, str]:
     return {}
 
 
+def fetch_index(ticker: str, lookback_bars: int = 120) -> Optional[pd.DataFrame]:
+    """KOSPI(KS11) 또는 KOSDAQ(KQ11) 지수 데이터 가져오기."""
+    try:
+        start = recent_start_for_lookback(lookback_bars)
+        df = fetch_ohlcv(ticker, start=start)
+        return df if (df is not None and not df.empty) else None
+    except Exception:
+        return None
+
+
 def update_cache_for_ticker(con, ticker: str, lookback_bars: int) -> None:
-    # Fetch recent window and upsert
     start = recent_start_for_lookback(lookback_bars)
     df = fetch_ohlcv(ticker, start=start)
     if df is None or df.empty:
@@ -48,22 +57,19 @@ def update_cache_for_ticker(con, ticker: str, lookback_bars: int) -> None:
     upsert_prices(con, ticker, df)
 
 
+# ─────────────────────────────────────────────
+# KRX 호가 단위
+# ─────────────────────────────────────────────
+
 def _krx_tick(price: float) -> int:
-    # KRX tick size rules (common board; simplified but practical)
     p = float(price)
-    if p < 1000:
-        return 1
-    if p < 5000:
-        return 5
-    if p < 10000:
-        return 10
-    if p < 50000:
-        return 50
-    if p < 100000:
-        return 100
-    if p < 500000:
-        return 500
-    return 1000
+    if p < 1_000:     return 1
+    if p < 5_000:     return 5
+    if p < 10_000:    return 10
+    if p < 50_000:    return 50
+    if p < 100_000:   return 100
+    if p < 500_000:   return 500
+    return 1_000
 
 
 def _round_up_to_tick(price: float) -> int:
@@ -71,41 +77,42 @@ def _round_up_to_tick(price: float) -> int:
     return int(math.ceil(float(price) / t) * t)
 
 
-
 def _round_down_to_tick(price: float) -> int:
     t = _krx_tick(price)
     return int(math.floor(float(price) / t) * t)
 
 
+# ─────────────────────────────────────────────
+# 매매 계획
+# ─────────────────────────────────────────────
 
 def compute_trade_plan(c: Candidate, settings: dict[str, Any]) -> dict[str, Any]:
-    """
-    Compute an actionable plan for HARD upgrades.
-    This is a plan-hint (not an execution order).
+    """진입·손절·TP1 계획 힌트 계산.
+
+    v2 변경:
+    - entry = close 기준이 아닌, 당일 고가 + 1틱 돌파매수 방식으로 변경
+      (종가 버퍼 방식은 갭 리스크가 너무 크다)
+    - 텔레그램 메시지에 "다음날 시가 확인 후 진입" 주의사항 추가
     """
     tp = settings.get("trade_plan", {})
-    entry_mode = str(tp.get("entry_mode", "close_buffer_pct"))
-    entry_buffer_pct = float(tp.get("entry_buffer_pct", 0.3))
     stop_atr_mult = float(tp.get("stop_atr_mult", 1.5))
     tp1_r_multiple = float(tp.get("tp1_r_multiple", 2.0))
+    max_gap_pct = float(tp.get("max_gap_pct", 2.0))
 
     close = float(c.metrics.get("close", 0.0))
     atr_pct = float(c.metrics.get("atr14_pct", 0.0))
     atr_val = close * (atr_pct / 100.0)
 
-    if entry_mode == "close_buffer_pct":
-        entry = close * (1.0 + entry_buffer_pct / 100.0)
-    else:
-        # Fallback/hint: assume entry near close
-        entry = close
+    # 진입: 당일 종가보다 1 ATR 의 20% 위 (=전날 고가 근사값)
+    # 실전에서는 다음날 시가를 확인 후 2% 이내 갭이면 진입
+    entry_raw = close + atr_val * 0.2
+    entry_i = _round_up_to_tick(entry_raw)
 
-    entry_i = _round_up_to_tick(entry)
-    stop = entry_i - (atr_val * stop_atr_mult)
-    stop_i = _round_down_to_tick(stop)
+    stop_raw = entry_i - atr_val * stop_atr_mult
+    stop_i = _round_down_to_tick(stop_raw)
 
     risk = max(1.0, float(entry_i - stop_i))
-    tp1 = float(entry_i) + tp1_r_multiple * risk
-    tp1_i = _round_down_to_tick(tp1)
+    tp1_i = _round_down_to_tick(float(entry_i) + tp1_r_multiple * risk)
 
     return {
         "entry": entry_i,
@@ -113,11 +120,47 @@ def compute_trade_plan(c: Candidate, settings: dict[str, Any]) -> dict[str, Any]
         "tp1": tp1_i,
         "risk": int(risk),
         "atr14_pct": atr_pct,
-        "entry_mode": entry_mode,
-        "entry_buffer_pct": entry_buffer_pct,
         "stop_atr_mult": stop_atr_mult,
         "tp1_r_multiple": tp1_r_multiple,
+        "max_gap_skip_pct": max_gap_pct,
     }
+
+
+# ─────────────────────────────────────────────
+# 텔레그램 메시지 포맷
+# ─────────────────────────────────────────────
+
+def _fmt_telegram(
+    candidates: list[Candidate],
+    settings: dict[str, Any],
+    market_ok: bool,
+    market_reason: str,
+) -> str:
+    regime_note = "" if market_ok else f" ⚠️ 시장 약세({market_reason})"
+    lines = [f"🔔 KRX Signal Forge — 신규 HARD 시그널{regime_note}"]
+
+    for c in candidates:
+        plan = compute_trade_plan(c, settings)
+        m = c.metrics
+        vol_x = m.get("vol", 0) / max(m.get("vma20", 1), 1)
+        pb_days = int(m.get("pullback_days", 0))
+        pb_vol = m.get("pullback_vol_ratio", 0.0)
+        pb_dep = m.get("pullback_depth_pct", 0.0)
+        rs = m.get("rs_12w", 0.0)
+        dip_n = int(m.get("ema20_dip_count", 1))
+        dip_tag = f"{dip_n}차 눌림" if dip_n <= 3 else f"{dip_n}차 눌림(주의)"
+
+        lines.append(
+            f"\n● {c.ticker} {c.name}  score={c.score:.1f}\n"
+            f"  현재가: {m.get('close',0):,.0f}원  |  {dip_tag}\n"
+            f"  Entry:  {plan['entry']:,}원  (다음날 시가 확인 후 진입)\n"
+            f"  Stop:   {plan['stop']:,}원  |  TP1: {plan['tp1']:,}원\n"
+            f"  갭 >{plan['max_gap_skip_pct']:.1f}% 시 스킵  |  R={plan['risk']:,}원\n"
+            f"  Vol: {vol_x:.1f}x  |  ATR: {m.get('atr14_pct',0):.1f}%  |  RS(12w): {rs:+.1f}%\n"
+            f"  눌림: {pb_days}일  Vol비율: {pb_vol:.2f}x  낙폭: {pb_dep:.1f}%"
+        )
+
+    return "\n".join(lines)
 
 
 def format_candidate(c: Candidate) -> str:
@@ -125,13 +168,19 @@ def format_candidate(c: Candidate) -> str:
     return (
         f"{c.ticker} {c.name} | {c.bucket} | score={c.score:.1f} "
         f"close={m.get('close',0):.0f} ema20={m.get('ema20',0):.0f} "
-        f"vol={m.get('vol',0):.0f} vma20={m.get('vma20',0):.0f} atr%={m.get('atr14_pct',0):.1f}"
+        f"vol={m.get('vol',0):.0f} vma20={m.get('vma20',0):.0f} "
+        f"atr%={m.get('atr14_pct',0):.1f} rs={m.get('rs_12w',0):+.1f}% "
+        f"pb_days={int(m.get('pullback_days',0))} pb_vol={m.get('pullback_vol_ratio',0):.2f}x"
     )
 
 
 def _utc_day() -> str:
     return pd.Timestamp.utcnow().strftime("%Y-%m-%d")
 
+
+# ─────────────────────────────────────────────
+# 메인 실행
+# ─────────────────────────────────────────────
 
 def run() -> int:
     timer = Timer()
@@ -142,125 +191,111 @@ def run() -> int:
     name_map = load_name_map()
     timer.lap("load_universe")
 
+    # ── 시장 레짐 체크 ────────────────────────────────────────
+    index_ticker = settings.get("index_ticker", "KS11")  # KOSPI 기본
+    index_df = fetch_index(index_ticker, lookback_bars=120)
+    regime = gate_market_regime(index_df)
+    market_ok = regime.ok
+    if not market_ok:
+        print(f"[WARN] 시장 레짐: {regime.reason} — 신호 발생 시 보수적 접근 권장")
+    timer.lap("market_regime")
+
+    # ── SQLite 캐시 ───────────────────────────────────────────
     con = connect_sqlite(SQLITE_PATH)
     ensure_schema(con)
     timer.lap("open_sqlite")
 
-    # State: last signals (kept for reporting)
-    _ = read_json(LAST_SIGNALS_PATH, default={})
-
-    # State: soft watchlist
-    watch_state = read_json(SOFT_WATCHLIST_PATH, default={"asof": None, "items": {}})
-    watch_items: dict[str, Any] = watch_state.get("items", {}) or {}
+    # ── 이전 HARD 목록 로드 (중복 알림 방지) ──────────────────
+    last_state = read_json(LAST_SIGNALS_PATH, default={})
+    last_hard_set: set[str] = set(
+        last_state.get("summary", {}).get("hard_top_tickers", [])
+    )
 
     drop: Dict[str, int] = {}
     skip: Dict[str, int] = {}
-
     candidates: list[Candidate] = []
     lookback_bars = int(settings.get("lookback_bars", 260))
 
+    # ── 종목별 스캔 ───────────────────────────────────────────
     for ticker in universe:
         try:
             update_cache_for_ticker(con, ticker, lookback_bars)
             df = load_prices(con, ticker, limit=max(lookback_bars, 260))
             name = name_map.get(ticker, "")
-            candidates.extend(scan_one(ticker, name, df, settings, drop, skip))
+            candidates.extend(
+                scan_one(ticker, name, df, settings, drop, skip, index_df=index_df)
+            )
         except Exception:
             skip["fetch_or_scan_error"] = skip.get("fetch_or_scan_error", 0) + 1
 
     timer.lap("scan_all")
 
-    hard_all = [c for c in candidates if c.bucket == "HARD"]
-    soft_all = [c for c in candidates if c.bucket == "SOFT"]
-
-    hard_all.sort(key=lambda x: (-x.score, x.ticker))
-    soft_all.sort(key=lambda x: (-x.score, x.ticker))
+    # ── 분류 및 정렬 ──────────────────────────────────────────
+    hard_all = sorted(
+        [c for c in candidates if c.bucket == "HARD"],
+        key=lambda x: (-x.score, x.ticker),
+    )
+    soft_all = sorted(
+        [c for c in candidates if c.bucket == "SOFT"],
+        key=lambda x: (-x.score, x.ticker),
+    )
 
     max_hard = int(settings["output"]["max_hard"])
     max_soft = int(settings["output"]["max_soft"])
 
-    # ---- Promotion detection: SOFT -> HARD
-    upgrades = [c for c in hard_all if c.ticker in watch_items]
-    upgrades.sort(key=lambda x: (-x.score, x.ticker))
-    upgrades = upgrades[:max_hard]
-
-    # ---- Update soft watchlist state
-    today = _utc_day()
-
-    # refresh/add today's soft items
-    for c in soft_all:
-        watch_items[c.ticker] = {
-            "ticker": c.ticker,
-            "name": c.name,
-            "score": c.score,
-            "metrics": c.metrics,
-            "checks": c.checks,
-            "first_seen": watch_items.get(c.ticker, {}).get("first_seen", today),
-            "last_seen": today,
-        }
-
-    # remove upgraded items (we only care about promotion moment)
-    for c in upgrades:
-        watch_items.pop(c.ticker, None)
-
-    # expire old items
-    expire_days = int(settings.get("trade_plan", {}).get("soft_watch_expire_days", 14))
-    to_del = []
-    today_ts = pd.Timestamp(today)
-    for t, it in watch_items.items():
-        last_seen = str(it.get("last_seen", today))
-        try:
-            age = (today_ts - pd.Timestamp(last_seen)).days
-        except Exception:
-            age = 0
-        if age > expire_days:
-            to_del.append(t)
-    for t in to_del:
-        watch_items.pop(t, None)
-
-    write_json(SOFT_WATCHLIST_PATH, {"asof": today, "items": watch_items})
-
-    # ---- Print summary (top lists)
     hard_top = hard_all[:max_hard]
     soft_top = soft_all[:max_soft]
 
-    print(f"Scanned: {len(universe)} | candidates: {len(candidates)} | hard={len(hard_top)} soft={len(soft_top)}")
+    # ── 신규 HARD 시그널 탐지 (어제 목록에 없던 종목만) ────────
+    new_hard = [c for c in hard_top if c.ticker not in last_hard_set]
+
+    # ── 콘솔 출력 ─────────────────────────────────────────────
+    print(
+        f"Scanned: {len(universe)} | candidates: {len(candidates)} "
+        f"| hard={len(hard_top)} soft={len(soft_top)} "
+        f"| new_hard={len(new_hard)}"
+    )
+    if not market_ok:
+        print(f"Market regime: {regime.reason}")
     if drop:
         top_drop = sorted(drop.items(), key=lambda x: -x[1])[:10]
-        print("Top drop reasons:", ", ".join([f"{k}:{v}" for k, v in top_drop]))
+        print("Drop:", ", ".join(f"{k}:{v}" for k, v in top_drop))
     if skip:
         top_skip = sorted(skip.items(), key=lambda x: -x[1])[:10]
-        print("Top skip reasons:", ", ".join([f"{k}:{v}" for k, v in top_skip]))
+        print("Skip:", ", ".join(f"{k}:{v}" for k, v in top_skip))
 
-    print("\nHARD candidates")
+    print("\n── HARD candidates ──")
     for c in hard_top:
-        print("-", format_candidate(c))
+        marker = "[NEW]" if c.ticker in {x.ticker for x in new_hard} else "     "
+        print(f"  {marker}", format_candidate(c))
 
-    print("\nSOFT watchlist")
+    print("\n── SOFT watchlist ──")
     for c in soft_top:
-        print("-", format_candidate(c))
+        print("  -", format_candidate(c))
 
-    # ---- Telegram: ONLY send promotions
-    if settings.get("telegram", {}).get("enabled", False) and upgrades:
-        lines = ["KRX Signal Forge — SOFT → HARD promotion"]
-        for c in upgrades:
-            plan = compute_trade_plan(c, settings)
-            lines.append(
-                f"- {c.ticker} {c.name} | score={c.score:.1f} close={c.metrics.get('close',0):.0f} "
-                f"Entry {plan['entry']:,} / Stop {plan['stop']:,} / TP1 {plan['tp1']:,} "
-                f"(ATR% {plan['atr14_pct']:.1f}, R {plan['risk']:,}, rule: skip if next-day gap > {float(settings.get('trade_plan',{}).get('max_gap_pct',2.0)):.1f}%)"
-            )
-        send_message("\n".join(lines))
+    # ── 텔레그램: 신규 HARD 시그널만 전송 ───────────────────────
+    # (BUG FIX: 기존 SOFT→HARD 승격 방식 폐기.
+    #  오늘 새로 HARD 조건을 충족한 종목을 즉시 전송.)
+    tg = settings.get("telegram", {})
+    if tg.get("enabled", False) and new_hard:
+        msg = _fmt_telegram(new_hard, settings, market_ok, regime.reason)
+        send_message(msg)
+        print(f"\n[Telegram] {len(new_hard)}개 신규 HARD 시그널 전송 완료")
+    elif tg.get("enabled", False) and not new_hard:
+        print("[Telegram] 신규 HARD 시그널 없음 — 전송 생략")
 
-    # ---- Save last_signals for reporting
+    # ── 상태 저장 ─────────────────────────────────────────────
     write_json(LAST_SIGNALS_PATH, {
         "asof": pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "summary": {
             "scanned": len(universe),
             "candidates": len(candidates),
             "hard_top": len(hard_top),
+            "hard_top_tickers": [c.ticker for c in hard_top],   # 다음날 중복 방지용
             "soft_top": len(soft_top),
-            "upgrades": [c.ticker for c in upgrades],
+            "new_hard": [c.ticker for c in new_hard],
+            "market_ok": market_ok,
+            "market_reason": regime.reason,
             "drop": drop,
             "skip": skip,
             "timing_ms": {lap.name: lap.ms for lap in timer.laps} | {"total": timer.total_ms()},
