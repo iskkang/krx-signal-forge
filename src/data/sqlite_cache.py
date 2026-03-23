@@ -53,7 +53,6 @@ def upsert_prices(con: sqlite3.Connection, ticker: str, df: pd.DataFrame) -> int
 
 
 def load_prices(con: sqlite3.Connection, ticker: str, limit: int = 400) -> pd.DataFrame:
-    """오름차순(오래된 → 최신) 정렬로 반환. indicators 계산에 적합한 순서."""
     q = """
         SELECT date, open, high, low, close, volume
         FROM prices
@@ -68,3 +67,11 @@ def load_prices(con: sqlite3.Connection, ticker: str, limit: int = 400) -> pd.Da
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.set_index("Date")
     return df
+
+
+def get_latest_date(con: sqlite3.Connection, ticker: str) -> str | None:
+    """캐시에 저장된 ticker 의 가장 최근 날짜 반환. 없으면 None."""
+    row = con.execute(
+        "SELECT MAX(date) FROM prices WHERE ticker = ?", (ticker,)
+    ).fetchone()
+    return row[0] if row and row[0] else None

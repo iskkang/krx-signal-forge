@@ -3,30 +3,25 @@
   "universe_path": "config/universe.txt",
   "lookback_bars": 260,
   "index_ticker": "KS11",
-
   "liquidity_filter": {
     "enabled": true,
     "min_price_krw": 1000,
     "min_traded_value_20d_krw": 1000000000
   },
-
   "volatility_filter": {
     "enabled": true,
     "min_atr_pct": 1.5,
     "max_atr_pct": 12.0
   },
-
   "trend_filter": {
     "enabled": true,
     "ma200_required": true
   },
-
   "ema20_slope_filter": {
     "enabled": true,
     "min_slope_pct": 0.0,
     "lookback": 10
   },
-
   "setup_filter": {
     "enabled": true,
     "max_day_ret_pct": 8.0,
@@ -36,13 +31,11 @@
     "hh_lookback": 60,
     "min_from_hh_pct": 78.0
   },
-
   "candle_filter": {
     "enabled": true,
     "min_close_pct": 0.55,
     "min_body_ratio": 0.35
   },
-
   "pullback_filter": {
     "enabled": true,
     "min_days": 2,
@@ -50,7 +43,6 @@
     "max_vol_ratio": 0.85,
     "max_depth_pct": 15.0
   },
-
   "strategy": {
     "name": "ema20_reclaim_with_volume",
     "ema_fast": 20,
@@ -59,19 +51,20 @@
     "volume_mult_hard": 1.2,
     "volume_mult_soft": 1.0
   },
-
   "output": {
     "max_hard": 5,
     "max_soft": 20
   },
-
   "telegram": {
     "enabled": true
   },
-
   "trade_plan": {
     "stop_atr_mult": 1.5,
     "tp1_r_multiple": 2.0,
     "max_gap_pct": 2.0
+  },
+  "cache": {
+    "max_workers": 12,
+    "fetch_timeout_sec": 480.0
   }
 }
