@@ -175,7 +175,7 @@ def format_candidate(c: Candidate) -> str:
 
 
 def _utc_day() -> str:
-    return pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    return pd.Timestamp.now('UTC').strftime("%Y-%m-%d")
 
 
 # ─────────────────────────────────────────────
@@ -286,7 +286,7 @@ def run() -> int:
 
     # ── 상태 저장 ─────────────────────────────────────────────
     write_json(LAST_SIGNALS_PATH, {
-        "asof": pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "asof": pd.Timestamp.now('UTC').strftime("%Y-%m-%dT%H:%M:%SZ"),
         "summary": {
             "scanned": len(universe),
             "candidates": len(candidates),

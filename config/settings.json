@@ -6,8 +6,8 @@
 
   "liquidity_filter": {
     "enabled": true,
-    "min_price_krw": 2000,
-    "min_traded_value_20d_krw": 5000000000
+    "min_price_krw": 1000,
+    "min_traded_value_20d_krw": 2000000000
   },
 
   "volatility_filter": {
@@ -23,14 +23,8 @@
 
   "ema20_slope_filter": {
     "enabled": true,
-    "min_slope_pct": 0.5,
+    "min_slope_pct": 0.3,
     "lookback": 10
-  },
-
-  "candle_filter": {
-    "enabled": true,
-    "min_close_pct": 0.60,
-    "min_body_ratio": 0.40
   },
 
   "setup_filter": {
@@ -40,6 +34,12 @@
     "ema20_band_pct": 3.0,
     "hh_lookback": 60,
     "min_from_hh_pct": 80.0
+  },
+
+  "candle_filter": {
+    "enabled": true,
+    "min_close_pct": 0.55,
+    "min_body_ratio": 0.35
   },
 
   "pullback_filter": {
